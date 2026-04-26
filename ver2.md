@@ -11,16 +11,14 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, \
     NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib import rcParams
+from matplotlib import rcParams, cm
 from matplotlib.ticker import FuncFormatter
-import matplotlib.patches as patches
-import matplotlib.colors as mcolors
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
-                               QInputDialog, QMessageBox, QProgressDialog, QDialog)
-from PySide6.QtGui import QTextCursor, QIcon, QCloseEvent
+                               QInputDialog, QMessageBox, QProgressDialog)
+from PySide6.QtGui import QTextCursor, QIcon
 from PySide6.QtCore import Qt
 
 from shapely.geometry import LineString, Polygon, Point, box
@@ -34,195 +32,15 @@ rcParams['font.family'] = 'Malgun Gothic'
 rcParams['axes.unicode_minus'] = False
 
 
-# =========================================================================
-# [디버깅 팝업] D단계 시각화: 가상 슬릿 위치 + 적분 경로 + q₀ 분포
-# =========================================================================
-class ShearFlowSingleDialog(QDialog):
-    def __init__(self, graph_edges, graph_nodes, root_node, mode="q_final", parent=None):
-        super().__init__(parent)
-
-        self.graph_edges = graph_edges
-        self.graph_nodes = graph_nodes
-        self.root_node = root_node
-        self.mode = mode
-
-        title_map = {
-            "q0": "q0 (Open Section)",
-            "qc": "qc (Circulation)",
-            "q_final": "q_final (Total Shear Flow)"
-        }
-
-        self.setWindowTitle(title_map.get(mode, mode))
-        self.resize(900, 800)
-
-        layout = QVBoxLayout(self)
-
-        self.fig = Figure(figsize=(8, 7))
-        self.canvas = FigureCanvas(self.fig)
-        layout.addWidget(self.canvas)
-
-        self.draw_plot()
-
-    def showEvent(self, event):
-        self.draw_plot()
-
-    def get_value(self, edge):
-        if self.mode == "q0":
-            return float(edge.get("q0_mean", 0.0))
-
-        elif self.mode == "qc":
-            return float(edge.get("qc_correction", 0.0))
-
-        elif self.mode == "q_final":
-            return float(edge.get("q_final_mean", 0.0))
-
-        return 0.0
-
-    def draw_plot(self):
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
-        ax.set_aspect("equal")
-
-        values = [self.get_value(e) for e in self.graph_edges]
-        max_abs = max([abs(v) for v in values], default=1.0)
-        if max_abs < 1e-12:
-            max_abs = 1.0
-
-        cmap = plt.get_cmap("coolwarm")
-
-        for e in self.graph_edges:
-            coords = list(e["line"].coords)
-            xs = [p[0] for p in coords]
-            ys = [p[1] for p in coords]
-
-            val = self.get_value(e)
-            color = cmap(0.5 + 0.5 * val / max_abs)
-            lw = 1.5 + 4.0 * abs(val) / max_abs
-
-            ax.plot(xs, ys, color=color, linewidth=lw)
-
-        # root 표시
-        if self.root_node in self.graph_nodes:
-            x, y = self.graph_nodes[self.root_node]["coord"]
-            ax.scatter([x], [y], s=60)
-            ax.text(x, y, "ROOT", fontsize=9)
-
-        sm = plt.cm.ScalarMappable(
-            cmap=cmap,
-            norm=plt.Normalize(vmin=-max_abs, vmax=max_abs)
-        )
-        sm.set_array([])
-        self.fig.colorbar(sm, ax=ax, label="Shear Flow [N/mm]")
-
-        ax.set_title(self.windowTitle())
-        ax.grid(True)
-
-        self.canvas.draw()
-
-    def change_mode(self, text):
-        self.mode = text
-        self.draw_plot()
-
-    def get_edge_value(self, edge):
-        if self.mode == "q0":
-            if "q0_mean" in edge:
-                return edge["q0_mean"]
-            if "q0" in edge and edge["q0"] is not None:
-                return float(np.mean(edge["q0"]))
-            return 0.0
-
-        elif self.mode == "qc_correction":
-            return float(edge.get("qc_correction", 0.0))
-
-        elif self.mode == "q_final":
-            if "q_final_mean" in edge:
-                return edge["q_final_mean"]
-            if "q_final" in edge and edge["q_final"] is not None:
-                return float(np.mean(edge["q_final"]))
-            return 0.0
-
-        return 0.0
-
-    def draw_plot(self):
-        print("\n--- DRAW QC CHECK ---")
-        for e in self.graph_edges[:5]:
-            print(e["id"], e.get("qc_correction"))
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
-        ax.set_aspect("equal", adjustable="box")
-        ax.grid(True, alpha=0.3)
-
-        values = [self.get_edge_value(e) for e in self.graph_edges]
-        max_abs = max([abs(v) for v in values], default=1.0)
-        if max_abs < 1e-12:
-            max_abs = 1.0
-
-        cmap = plt.get_cmap("rainbow")
-
-        for e in self.graph_edges:
-            line = e["line"]
-            coords = list(line.coords)
-            xs = [p[0] for p in coords]
-            ys = [p[1] for p in coords]
-
-            val = self.get_edge_value(e)
-            color = cmap(0.5 + 0.5 * val / max_abs)
-
-            lw = 1.5 + 4.0 * abs(val) / max_abs
-
-            ax.plot(xs, ys, color=color, linewidth=lw)
-
-            mid = line.interpolate(0.5, normalized=True)
-            ax.text(
-                mid.x,
-                mid.y,
-                f"E{e['id']}\n{val:.5f}",
-                fontsize=7,
-                ha="center",
-                va="center",
-                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none")
-            )
-
-        # root node 표시
-        if self.root_node is not None and self.root_node in self.graph_nodes:
-            x, y = self.graph_nodes[self.root_node]["coord"]
-            ax.scatter([x], [y], s=80, marker="o")
-            ax.text(x, y, "ROOT", fontsize=9, fontweight="bold")
-
-        title_map = {
-            "q0": "Open-section Basic Shear Flow q0",
-            "qc_correction": "Circulation Correction qc",
-            "q_final": "Final Shear Flow q = q0 + qc"
-        }
-
-        ax.set_title(title_map.get(self.mode, self.mode))
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-
-        sm = plt.cm.ScalarMappable(
-            cmap=cmap,
-            norm=plt.Normalize(vmin=-max_abs, vmax=max_abs)
-        )
-        sm.set_array([])
-        self.fig.colorbar(sm, ax=ax, label="Shear Flow [N/mm]")
-
-        self.canvas.draw()
-
-
-
-# =========================================================================
-# 메인 클래스
-# =========================================================================
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HHI-FAIVE - Ship Floating Strength Analyzer")
+        self.setWindowTitle("HHI-FAIVE - Ship Floating Strength Analyzer (Vertical Thickness Distribution)")
         self.setWindowIcon(QIcon('icon.ico'))
         self.resize(2000, 1200)
         self.saved_frames_data = []
         self.current_dxf_path = ""
         self.is_processing = False
-        self.debug_dialogs = []
         self.reset_analysis_data()
         self.init_ui()
 
@@ -240,20 +58,13 @@ class UltimateShipAnalyzer(QMainWindow):
         self.hull_centroid = Point(0, 0)
         self.shell_thickness_inputs = []
         self.is_calculated = False
-        self.mesh_cells = []
+        
+        self.mesh_cells = [] # 100mm 분할된 전단응력 세그먼트를 저장하는 용도로 재활용
         self.centerlines = []
-        self.shear_flow_centerlines = []
-        self.cell_points = []
-        self.max_shell_q_idx = -1
+        
         self.max_shell_thk = 0.0
-        self.q_per_v = 0.0
-        self.max_Q = 0.0
-
-        self.graph_edges = []
-        self.graph_nodes = {}
-        self.root_node = None
-        self.slit_edge_ids = set()
-
+        self.max_mesh_coords = (0, 0)
+        
         self.calc_total_area = 0.0
         self.calc_ixx = 0.0
         self.calc_depth = 0.0
@@ -268,11 +79,6 @@ class UltimateShipAnalyzer(QMainWindow):
         self.allow_fs = 0.0
         self.raw_swbm = 0.0
         self.raw_shear = 0.0
-        self.max_layer_name = ""
-        self.calc_max_q_val = 0.0
-        for d in self.debug_dialogs:
-            d.close()
-        self.debug_dialogs.clear()
 
     def init_ui(self):
         main_scroll = QScrollArea()
@@ -367,7 +173,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.thickness_scroll.setWidget(self.scroll_content)
         control_panel_layout.addWidget(self.thickness_scroll)
 
-        self.btn_calc = QPushButton("2. Cross Section Analysis 🧮")
+        self.btn_calc = QPushButton("2. Section Analysis & 1D Graph 🧮")
         self.btn_calc.setFixedHeight(50)
         self.btn_calc.setStyleSheet(
             "background-color: #28B463; color: white; font-weight: bold; font-size: 14px; margin-top: 5px;")
@@ -400,7 +206,7 @@ class UltimateShipAnalyzer(QMainWindow):
         work_area = QWidget()
         work_layout = QVBoxLayout(work_area)
         viz_splitter = QSplitter(Qt.Horizontal)
-        for i, title in enumerate(["[Cross Section View (1D)]", "[Closed Cells & Points]"]):
+        for i, title in enumerate(["[Cross Section View (1D)]", "[Shear Stress Heatmap & Probe]"]):
             container = QWidget()
             lay = QVBoxLayout(container)
             lay.addWidget(QLabel(f"<b>{title}</b>"))
@@ -602,7 +408,7 @@ class UltimateShipAnalyzer(QMainWindow):
     # 메인 연산
     # =====================================================================
 
-   def calculate_total_inertia(self):
+    def calculate_total_inertia(self):
         if self.is_processing: return
         self.is_processing = True
         self.btn_calc.setEnabled(False)
@@ -615,6 +421,7 @@ class UltimateShipAnalyzer(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
+        # 도면 데이터의 1D선/노드 변환을 위한 기본 유틸리티 함수 유지
         def filter_short(lines, ml=100.0):
             return [l for l in lines if l.length >= ml]
 
@@ -1060,22 +867,6 @@ class UltimateShipAnalyzer(QMainWindow):
 
             all_cl = split_all_lines_at_intersections(all_cl)
 
-            progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
-            QApplication.processEvents()
-
-            planarized_network = unary_union([cl['line'] for cl in all_cl])
-            try:
-                from shapely import set_precision
-                planarized_network = set_precision(planarized_network, grid_size=0.01)
-            except ImportError:
-                pass
-
-            raw_loops = list(polygonize(planarized_network))
-            # [수정] 미세 오차 루프만 제외하고, 셀/슬릿 개수 1:1 매칭을 위해 1.0 이상 필터링 완화
-            self.mesh_cells = [poly for poly in raw_loops if poly.area >= 1.0]
-
-            self.shear_flow_centerlines = list(all_cl)
-
             # =============================================================
             # 종골재(Stiffener) 추출 및 1D Inertia 연산을 위해 centerlines 생성
             # =============================================================
@@ -1163,7 +954,7 @@ class UltimateShipAnalyzer(QMainWindow):
             self.centerlines = all_combined_cl
 
             # =============================================================
-            # 11.5: 1D Line 기반의 이너시아(Inertia) 연산
+            # Step 11.5: 1D Line 기반의 이너시아(Inertia) 연산 (전체 레이어)
             # =============================================================
             progress.setLabelText("Step 11.5: 1D Line 기반 이너시아(Inertia) 연산...")
             QApplication.processEvents()
@@ -1220,683 +1011,97 @@ class UltimateShipAnalyzer(QMainWindow):
             self.act_fb = (abs(self.raw_swbm) * 9.80665 * 1e6) / z_act_top_mm3
 
             # =============================================================
-            # Step 12: Macro Edge 추출 (전체 단면 사용, 엄격한 degree=1 필터)
+            # Step 12: 수직 두께 분배(Vertical Thickness Distribution) 기반 전단 응력 계산
             # =============================================================
-            progress.setLabelText("Step 12: 전체 단면도 기반 Macro Edge 추출 중...")
+            progress.setLabelText("Step 12: Calculating Shear Stress (Vertical Thickness Method)...")
             QApplication.processEvents()
 
-            # -------------------------------------------------------------
-            # Half-section shear model 생성
-            # - 좌현 반단면 기준: x <= CENTER_X_MAX 영역만 사용
-            # - 중앙 밴드(-15 < x < 20)에 완전히 들어오는 1D 라인은 중앙 shared wall로 간주
-            #   → 반단면 전용 복사본에서만 thickness 1/2 적용
-            # - 원본 self.centerlines / 이너시아 계산 파이프라인은 유지
-            # -------------------------------------------------------------
-            CENTER_X_MIN = -15.0
-            CENTER_X_MAX = 20.0
-            HALF_EPS = 1e-6
+            V_shear = abs(self.raw_shear) * 1000.0 * 9.80665 # N
+            
+            # 전단류(q) 계산 대상 레이어 한정
+            target_layers = ['1999', '1102', '157', 'bridge']
+
+            all_mesh_segments = []
+            # 전체 1D Line을 100mm 이하의 세그먼트로 분할
+            for cl in self.centerlines:
+                coords = list(cl['line'].coords)
+                t = cl.get('thickness', 10.0)
+                ctype = cl.get('type', 'internal')
+                is_target = ctype in target_layers
 
-            from shapely.geometry import box
-            from shapely.geometry import LineString as ShapelyLineString
-
-            def _extract_lines(geom):
-                if geom.is_empty:
-                    return []
-                if geom.geom_type == 'LineString':
-                    return [geom]
-                if geom.geom_type == 'MultiLineString':
-                    return list(geom.geoms)
-                if geom.geom_type == 'GeometryCollection':
-                    out = []
-                    for g in geom.geoms:
-                        if g.geom_type == 'LineString':
-                            out.append(g)
-                        elif g.geom_type == 'MultiLineString':
-                            out.extend(list(g.geoms))
-                    return out
-                return []
-
-            def _clone_cl_with_line(cl, line, thickness=None, extra=None):
-                d = dict(cl)
-                d['line'] = line
-                if thickness is not None:
-                    d['thickness'] = thickness
-                if extra:
-                    d.update(extra)
-                return d
-
-            all_bounds = [cl['line'].bounds for cl in self.shear_flow_centerlines if not cl['line'].is_empty]
-            if not all_bounds:
-                raise ValueError('No shear-flow centerlines available for half-section graph.')
-
-            min_y_all = min(b[1] for b in all_bounds)
-            min_x_all = min(b[0] for b in all_bounds)
-            max_y_all = max(b[3] for b in all_bounds)
-            pad = 10000.0
-            half_clip_poly = box(min_x_all - pad, min_y_all - pad, CENTER_X_MAX, max_y_all + pad)
-
-            full_shear_lines_original = list(self.shear_flow_centerlines)
-            half_shear_lines = []
-
-            for cl in full_shear_lines_original:
-                line = cl['line']
-                coords = list(line.coords)
-                if len(coords) < 2:
-                    continue
-
-                xs = [p[0] for p in coords]
-                min_x = min(xs)
-                max_x = max(xs)
-
-                # 중앙 밴드에 완전히 들어오는 선: 중앙 shared wall로 간주, 두께 1/2
-                is_center_band_line = (min_x >= CENTER_X_MIN - HALF_EPS and max_x <= CENTER_X_MAX + HALF_EPS)
-                if is_center_band_line:
-                    half_shear_lines.append(_clone_cl_with_line(
-                        cl,
-                        ShapelyLineString(coords),
-                        thickness=float(cl.get('thickness', 10.0)) * 0.5,
-                        extra={
-                            'is_half_model': True,
-                            'is_center_shared_wall': True,
-                            'original_thickness': float(cl.get('thickness', 10.0))
-                        }
-                    ))
-                    continue
-
-                # 완전히 우현 쪽이면 제외
-                if min_x > CENTER_X_MAX + HALF_EPS:
-                    continue
-
-                # 좌현 쪽 또는 중심선을 가로지르는 선: x <= CENTER_X_MAX 영역만 사용
-                try:
-                    clipped = line.intersection(half_clip_poly)
-                except Exception:
-                    clipped = line
-
-                for g in _extract_lines(clipped):
-                    if g.length < 1e-6:
-                        continue
-                    half_shear_lines.append(_clone_cl_with_line(
-                        cl,
-                        g,
-                        thickness=float(cl.get('thickness', 10.0)),
-                        extra={
-                            'is_half_model': True,
-                            'is_center_shared_wall': False,
-                            'original_thickness': float(cl.get('thickness', 10.0))
-                        }
-                    ))
-
-            # 반단면 전단류 계산에는 half_shear_lines만 사용
-            self.full_shear_flow_centerlines = full_shear_lines_original
-            self.shear_flow_centerlines = half_shear_lines
-            full_shear_lines = half_shear_lines
-
-            # 반단면용 cell 재검출
-            if full_shear_lines:
-                half_planarized_network = unary_union([cl['line'] for cl in full_shear_lines])
-                try:
-                    from shapely import set_precision
-                    half_planarized_network = set_precision(half_planarized_network, grid_size=0.01)
-                except ImportError:
-                    pass
-                half_raw_loops = list(polygonize(half_planarized_network))
-                self.mesh_cells = [poly for poly in half_raw_loops if poly.area >= 1.0]
-
-            raw_edges = []
-            for i, cl in enumerate(full_shear_lines):
-                c = list(cl['line'].coords)
-                if len(c) < 2: continue
-                p1 = (round(c[0][0], 2), round(c[0][1], 2))
-                p2 = (round(c[-1][0], 2), round(c[-1][1], 2))
-                if p1 == p2: continue  # 점으로 수축된 선분 제외
-
-                thk = cl.get('thickness', 10.0)
-                raw_edges.append({'p1': p1, 'p2': p2, 'line': cl['line'], 'thk': thk})
-
-            # Degree=1 맹장 엣지 반복 제거 (Pruning)
-            changed = True
-            safe_loop_count = 0
-            while changed and safe_loop_count < 1000:
-                safe_loop_count += 1
-                if safe_loop_count % 10 == 0:
-                    QApplication.processEvents()
-
-                changed = False
-                node_deg = defaultdict(int)
-                for e in raw_edges:
-                    node_deg[e['p1']] += 1
-                    node_deg[e['p2']] += 1
-
-                survivors = []
-                for e in raw_edges:
-                    if node_deg[e['p1']] <= 1 or node_deg[e['p2']] <= 1:
-                        changed = True
-                    else:
-                        survivors.append(e)
-
-                if not survivors and raw_edges:
-                    survivors = raw_edges
-                    break
-                raw_edges = survivors
-
-            deg = defaultdict(int)
-            adj = defaultdict(list)
-            for i, e in enumerate(raw_edges):
-                deg[e['p1']] += 1
-                deg[e['p2']] += 1
-                adj[e['p1']].append(i)
-                adj[e['p2']].append(i)
-
-            strict_vertices = set()
-            for pt, d in deg.items():
-                if abs(pt[0]) <= 1e-2:
-                    strict_vertices.add(pt)
-                elif d >= 3:
-                    strict_vertices.add(pt)
-                elif d == 2:
-                    e1_idx, e2_idx = adj[pt]
-                    e1, e2 = raw_edges[e1_idx], raw_edges[e2_idx]
-
-                    def get_vec_away(edge, point):
-                        coords = list(edge['line'].coords)
-                        p_start = (round(coords[0][0], 2), round(coords[0][1], 2))
-                        if p_start == point:
-                            v = np.array(coords[1]) - np.array(coords[0])
-                        else:
-                            v = np.array(coords[-2]) - np.array(coords[-1])
-                        norm = np.linalg.norm(v)
-                        return (v / norm) if norm > 1e-6 else np.array([0.0, 0.0])
-
-                    v1 = get_vec_away(e1, pt)
-                    v2 = get_vec_away(e2, pt)
-                    cos_th = np.clip(np.dot(v1, v2), -1.0, 1.0)
-                    angle = np.degrees(np.arccos(cos_th))
-
-                    if abs(angle - 180.0) > 2.0:
-                        strict_vertices.add(pt)
-                elif d == 1:
-                    strict_vertices.add(pt)
-
-            if not strict_vertices and raw_edges:
-                strict_vertices.add(raw_edges[0]['p1'])
-
-            self.cell_points = list(strict_vertices)
-            self.graph_nodes = {nid: {'coord': pt} for nid, pt in enumerate(self.cell_points)}
-            pt_to_nid = {pt: nid for nid, pt in enumerate(self.cell_points)}
-
-            macro_edges = []
-            visited_raw_edges = set()
-            current_eid = 0
-            node_edges = defaultdict(list)
-
-            for start_pt in self.cell_points:
-                for edge_idx in adj.get(start_pt, []):
-                    if edge_idx in visited_raw_edges:
-                        continue
-
-                    current_pt = start_pt
-                    current_edge_idx = edge_idx
-                    path_coords = []
-                    thk = raw_edges[current_edge_idx]['thk']
-
-                    loop_safeguard = 0
-                    while True:
-                        loop_safeguard += 1
-                        if loop_safeguard > 1000: break
-                        if loop_safeguard % 100 == 0: QApplication.processEvents()
-
-                        visited_raw_edges.add(current_edge_idx)
-                        edge = raw_edges[current_edge_idx]
-
-                        c = list(edge['line'].coords)
-                        e_p1, e_p2 = edge['p1'], edge['p2']
-
-                        if e_p2 == current_pt:
-                            c = c[::-1]
-                            nxt_pt = e_p1
-                        else:
-                            nxt_pt = e_p2
-
-                        if not path_coords:
-                            path_coords.extend(c)
-                        else:
-                            path_coords.extend(c[1:])
-
-                        current_pt = nxt_pt
-
-                        if current_pt in strict_vertices:
-                            break
-
-                        next_edges = [ei for ei in adj[current_pt] if ei not in visited_raw_edges]
-                        if not next_edges:
-                            break
-                        current_edge_idx = next_edges[0]
-
-                    macro_line = LineString(path_coords)
-                    mid_pt = macro_line.interpolate(0.5, normalized=True)
-                    cell_count = sum(1 for poly in self.mesh_cells if poly.exterior.distance(mid_pt) < 1.0)
-
-                    # [수정] Slit 선정 개선 (공유 격벽 배제 및 외곽 센터라인 최우선 타겟화)
-                    # Cost가 가장 높은 엣지가 Kruskal에서 최종 거부되어 Slit이 됨
-                    if cell_count >= 2:
-                        cost = -10000.0  # Shared Wall: 무조건 Tree Edge로 편입 (물리적 경로 보존)
-                    elif cell_count == 1:
-                        # Outer Wall: 최상단(Y 큼)이면서 정중앙(X=0)일수록 가장 높은 Cost를 받아 Slit이 됨
-                        cost = mid_pt.y * 100.0 - abs(mid_pt.x) * 2.0
-                    else:
-                        cost = -20000.0  # 맹장 선분 등
-
-                    sn = pt_to_nid[start_pt]
-                    en = pt_to_nid.get(current_pt, sn)
-
-                    # Self-loop(sn == en)도 그대로 macro_edges에 등록 (이후 Kruskal이 무조건 Slit으로 처리함)
-                    edge_dict = {
-                        'id': current_eid, 'start_node': sn, 'end_node': en,
-                        'line': macro_line, 'length': macro_line.length,
-                        'thickness': thk, 'cell_count': cell_count, 'cost': cost
-                    }
-                    macro_edges.append(edge_dict)
-                    node_edges[sn].append(current_eid)
-                    if sn != en:
-                        node_edges[en].append(current_eid)
-                    current_eid += 1
-
-            self.graph_edges = macro_edges
-
-            # =============================================================
-            # =============================================================
-            # Step 13: q0 계산 - Leaf -> Root 보존형 누적
-            # =============================================================
-            progress.setLabelText("Step 13: q0 leaf-to-root 보존형 누적 및 검증 중...")
-            QApplication.processEvents()
-
-            if not self.graph_nodes or not self.graph_edges:
-                raise ValueError(
-                    "Graph nodes/edges are empty. Macro edge extraction failed before q0 calculation."
-                )
-
-            # -------------------------------------------------------------
-            # 1. reference slit 1개 선정: 외곽 + deck + centerline 우선
-            # -------------------------------------------------------------
-            max_y = max(node['coord'][1] for node in self.graph_nodes.values())
-            min_y = min(node['coord'][1] for node in self.graph_nodes.values())
-            tol_x = 100.0
-            tol_y = 100.0
-
-            candidates = []
-            for e in self.graph_edges:
-                if e.get('cell_count', 0) != 1:
-                    continue
-                mid_pt = e['line'].interpolate(0.5, normalized=True)
-                if abs(mid_pt.x) > tol_x:
-                    continue
-                if mid_pt.y < max_y - tol_y:
-                    continue
-                score = abs(mid_pt.x) + 2.0 * abs(max_y - mid_pt.y)
-                candidates.append((score, e))
-
-            # fallback: centerline/deck 조건이 너무 엄격해서 후보가 없으면 outer edge 중 deck/centerline 근접 우선
-            if not candidates:
-                for e in self.graph_edges:
-                    if e.get('cell_count', 0) != 1:
-                        continue
-                    mid_pt = e['line'].interpolate(0.5, normalized=True)
-                    score = 10.0 * abs(mid_pt.x) + abs(max_y - mid_pt.y)
-                    candidates.append((score, e))
-
-            candidates.sort(key=lambda x: x[0])
-            best_slit = candidates[0][1] if candidates else None
-            self.slit_edge_ids = {best_slit['id']} if best_slit else set()
-
-            for e in self.graph_edges:
-                e['is_slit'] = (e['id'] in self.slit_edge_ids)
-                e['S_accumulated'] = None
-                e['bfs_direction'] = None
-
-            # -------------------------------------------------------------
-            # 2. Root Node 설정: leaf-to-root 누적의 최종 종착지
-            #    선저/센터라인에 가까운 node를 우선 root로 둔다.
-            # -------------------------------------------------------------
-            self.root_node = min(
-                self.graph_nodes.keys(),
-                key=lambda nid: (
-                    self.graph_nodes[nid]['coord'][1],
-                    abs(self.graph_nodes[nid]['coord'][0])
-                )
-            )
-
-            # -------------------------------------------------------------
-            # 3. non-slit 그래프에서 spanning forest 생성
-            # -------------------------------------------------------------
-            adj_all = defaultdict(list)
-            for e in self.graph_edges:
-                if e['id'] in self.slit_edge_ids:
-                    continue
-                adj_all[e['start_node']].append(e)
-                adj_all[e['end_node']].append(e)
-
-            tree_edge_ids = set()
-            parent_node = {}
-            parent_edge = {}
-            children = defaultdict(list)
-            node_depth = {nid: float('inf') for nid in self.graph_nodes}
-            component_roots = []
-            visited_nodes = set()
-
-            start_nodes = [self.root_node] + list(self.graph_nodes.keys())
-            for start in start_nodes:
-                if start in visited_nodes:
-                    continue
-                component_roots.append(start)
-                visited_nodes.add(start)
-                parent_node[start] = None
-                parent_edge[start] = None
-                node_depth[start] = 0
-                queue = deque([start])
-
-                while queue:
-                    u = queue.popleft()
-                    for e in adj_all[u]:
-                        eid = e['id']
-                        v = e['start_node'] if e['end_node'] == u else e['end_node']
-                        if v not in visited_nodes:
-                            visited_nodes.add(v)
-                            parent_node[v] = u
-                            parent_edge[v] = eid
-                            children[u].append(v)
-                            node_depth[v] = node_depth[u] + 1
-                            tree_edge_ids.add(eid)
-                            queue.append(v)
-
-            # -------------------------------------------------------------
-            # 4. 각 edge 자체에서 S_local = ∫ y t ds 직접 적분
-            # -------------------------------------------------------------
-            for edge in self.graph_edges:
-                geom = edge['line']
-                coords = list(geom.coords)
-                if len(coords) < 2:
-                    edge['sample_s'] = np.array([0.0], dtype=float)
-                    edge['sample_pts'] = [(coords[0][0], coords[0][1])] if coords else [(0.0, 0.0)]
-                    edge['S_local_array'] = np.array([0.0], dtype=float)
-                    edge['S_local'] = 0.0
-                    continue
-
-                s_vals = [0.0]
-                pts = [(coords[0][0], coords[0][1])]
-                current_L = 0.0
-                for i in range(1, len(coords)):
-                    p1 = np.array(coords[i - 1], dtype=float)
-                    p2 = np.array(coords[i], dtype=float)
-                    seg_L = np.linalg.norm(p2 - p1)
-                    if seg_L < 1e-9:
-                        continue
-                    current_L += seg_L
-                    s_vals.append(current_L)
-                    pts.append((coords[i][0], coords[i][1]))
-
-                edge['sample_s'] = np.array(s_vals, dtype=float)
-                edge['sample_pts'] = pts
-
-                y_prime = np.array([pt[1] for pt in pts], dtype=float) - self.calc_na_bl
-                t = float(edge.get('thickness', 0.0))
-
-                S_loc = np.zeros(len(s_vals), dtype=float)
-                curr = 0.0
-                for k in range(1, len(s_vals)):
-                    y_avg = 0.5 * (y_prime[k - 1] + y_prime[k])
-                    ds_val = s_vals[k] - s_vals[k - 1]
-                    curr += y_avg * t * ds_val
-                    S_loc[k] = curr
-
-                edge['S_local_array'] = S_loc
-                edge['S_local'] = float(curr)
-
-            # -------------------------------------------------------------
-            # 5. Leaf -> Root 보존형 S 누적
-            #    leaf에서 S=0으로 시작하고, junction에서는 child contribution을 합산한다.
-            # -------------------------------------------------------------
-            s_at_node = {nid: 0.0 for nid in self.graph_nodes}
-            tree_edge_by_id = {e['id']: e for e in self.graph_edges}
-
-            nodes_by_depth = sorted(
-                self.graph_nodes.keys(),
-                key=lambda nid: node_depth.get(nid, 0),
-                reverse=True
-            )
-
-            for nid in nodes_by_depth:
-                pnode = parent_node.get(nid)
-                peid = parent_edge.get(nid)
-                if pnode is None or peid is None:
-                    continue
-
-                e = tree_edge_by_id[peid]
-                S_start = s_at_node[nid]
-
-                # traversal: nid -> pnode
-                if e['start_node'] == nid and e['end_node'] == pnode:
-                    # geometry 방향과 traversal 방향 동일
-                    e['S_accumulated'] = S_start + e['S_local_array']
-                    e['bfs_direction'] = 'forward'
-                    S_exit = float(e['S_accumulated'][-1])
-                elif e['end_node'] == nid and e['start_node'] == pnode:
-                    # geometry 방향과 traversal 방향 반대
-                    # geometry order에서 start(parent) 값이 exit, end(child) 값이 S_start
-                    e['S_accumulated'] = S_start + (e['S_local'] - e['S_local_array'])
-                    e['bfs_direction'] = 'reverse'
-                    S_exit = float(e['S_accumulated'][0])
-                else:
-                    continue
-
-                # junction 보존: parent node로 들어오는 S contribution을 합산
-                s_at_node[pnode] = s_at_node.get(pnode, 0.0) + S_exit
-
-            # -------------------------------------------------------------
-            # 6. tree 밖 edge 복원 및 loop residual 저장
-            # -------------------------------------------------------------
-            loop_residuals = []
-            for e in self.graph_edges:
-                if e.get('S_accumulated') is not None:
-                    continue
-
-                sn = e['start_node']
-                en = e['end_node']
-                s_sn = s_at_node.get(sn)
-                s_en = s_at_node.get(en)
-
-                # 더 깊은 node에서 root 방향으로 적분하는 것을 우선
-                if s_sn is not None and s_en is not None:
-                    if node_depth.get(sn, 0) >= node_depth.get(en, 0):
-                        e['S_accumulated'] = s_sn + e['S_local_array']
-                        e['bfs_direction'] = 'forward'
-                        residual = (s_sn + e['S_local']) - s_en
-                    else:
-                        e['S_accumulated'] = s_en + (e['S_local'] - e['S_local_array'])
-                        e['bfs_direction'] = 'reverse'
-                        residual = (s_en + e['S_local']) - s_sn
-                    loop_residuals.append((e['id'], float(residual)))
-                elif s_sn is not None:
-                    e['S_accumulated'] = s_sn + e['S_local_array']
-                    e['bfs_direction'] = 'forward'
-                elif s_en is not None:
-                    e['S_accumulated'] = s_en + (e['S_local'] - e['S_local_array'])
-                    e['bfs_direction'] = 'reverse'
-                else:
-                    e['S_accumulated'] = None
-                    e['bfs_direction'] = None
-
-            # -------------------------------------------------------------
-            # 7. q0 산출
-            # -------------------------------------------------------------
-            V_shear = abs(self.raw_shear) * 1000.0 * 9.80665
-            Ixx = self.calc_ixx
-            missing_s_edges = []
-            max_q0_val = 0.0
-
-            for edge in self.graph_edges:
-                if edge.get('S_accumulated') is not None:
-                    if Ixx > 1e-6:
-                        q0 = (V_shear * edge['S_accumulated']) / Ixx
-                    else:
-                        q0 = np.zeros(len(edge['sample_s']), dtype=float)
-                    edge['q0'] = q0
-                    edge['q0_geom'] = q0
-                    edge['q0_mean'] = float(np.mean(q0)) if len(q0) else 0.0
-                    max_q0_val = max(max_q0_val, float(np.max(np.abs(q0))))
-                else:
-                    missing_s_edges.append(edge['id'])
-                    edge['q0'] = np.zeros(len(edge['sample_s']), dtype=float)
-                    edge['q0_geom'] = edge['q0']
-                    edge['q0_mean'] = 0.0
-
-            # -------------------------------------------------------------
-            # Step 14: B matrix 기반 qc 계산
-            # -------------------------------------------------------------
-            progress.setLabelText("Step 14: B matrix 기반 qc 계산 중...")
-            QApplication.processEvents()
-
-            edge_index_map = {e['id']: i for i, e in enumerate(self.graph_edges)}
-            n_cells = len(self.mesh_cells)
-            n_edges = len(self.graph_edges)
-
-            for e in self.graph_edges:
-                e['adjacent_cell_ids'] = []
-                mid_pt = e['line'].interpolate(0.5, normalized=True)
-                for cid, poly in enumerate(self.mesh_cells):
-                    if poly.exterior.distance(mid_pt) < 2.0:
-                        e['adjacent_cell_ids'].append(cid)
-
-            def edge_unit_vector(edge):
-                c = list(edge['line'].coords)
-                p1 = np.array(c[0], dtype=float)
-                p2 = np.array(c[-1], dtype=float)
-                v = p2 - p1
-                n = np.linalg.norm(v)
-                return v / n if n > 1e-12 else np.array([0.0, 0.0])
-
-            def cell_edge_sign(poly, edge):
-                coords = list(poly.exterior.coords)
-                ev = edge_unit_vector(edge)
-                if np.linalg.norm(ev) < 1e-12:
-                    return 0.0
-                edge_mid = edge['line'].interpolate(0.5, normalized=True)
-                best_dist = float('inf')
-                best_vec = None
                 for i in range(len(coords) - 1):
-                    p1 = np.array(coords[i], dtype=float)
-                    p2 = np.array(coords[i + 1], dtype=float)
-                    seg = LineString([tuple(p1), tuple(p2)])
-                    d = seg.distance(edge_mid)
-                    if d < best_dist:
-                        best_dist = d
-                        v = p2 - p1
-                        n = np.linalg.norm(v)
-                        best_vec = v / n if n > 1e-12 else None
-                if best_vec is None:
-                    return 0.0
-                return 1.0 if np.dot(ev, best_vec) >= 0 else -1.0
+                    p1 = np.array(coords[i])
+                    p2 = np.array(coords[i + 1])
+                    v = p2 - p1
+                    L = np.linalg.norm(v)
+                    if L < 1e-6: continue
 
-            B = np.zeros((n_cells, n_edges), dtype=float)
-            for e in self.graph_edges:
-                idx = edge_index_map[e['id']]
-                for cid in e.get('adjacent_cell_ids', []):
-                    B[cid, idx] = cell_edge_sign(self.mesh_cells[cid], e)
-            self.B_matrix = B
+                    num_subs = max(1, int(np.ceil(L / 100.0)))
+                    sub_v = v / num_subs
 
-            q0_edge = np.zeros(n_edges, dtype=float)
-            w = np.zeros(n_edges, dtype=float)
-            for e in self.graph_edges:
-                idx = edge_index_map[e['id']]
-                q0_edge[idx] = float(e.get('q0_mean', 0.0))
-                L = float(e.get('length', 0.0))
-                t = float(e.get('thickness', 0.0))
-                w[idx] = L / t if t > 1e-12 else 0.0
+                    for j in range(num_subs):
+                        sp1 = p1 + sub_v * j
+                        sp2 = p1 + sub_v * (j + 1)
+                        sL = np.linalg.norm(sp2 - sp1)
+                        s_area = sL * t
+                        s_yc = (sp1[1] + sp2[1]) / 2.0
+                        all_mesh_segments.append({
+                            'p1': sp1, 'p2': sp2, 'L': sL, 't': t,
+                            'area': s_area, 'yc': s_yc, 'type': ctype,
+                            'is_target': is_target, 'dy': abs(sp2[1] - sp1[1]),
+                            'miny': min(sp1[1], sp2[1]), 'maxy': max(sp1[1], sp2[1])
+                        })
 
-            Wq0 = w * q0_edge
-            M = B @ (w[:, None] * B.T)
-            r = -B @ Wq0
-            M_reg = M + 1e-9 * np.eye(n_cells)
+            max_tau = 0.0
+            max_tau_info = None
+            self.mesh_cells = [] 
 
-            try:
-                qc = np.linalg.solve(M_reg, r)
-            except np.linalg.LinAlgError:
-                qc = np.linalg.lstsq(M_reg, r, rcond=None)[0]
+            # 각 Target 세그먼트의 도심(y_eval) 기준으로 Q와 Ty를 계산하여 전단류(q) 및 전단응력(τ) 도출
+            for seg in all_mesh_segments:
+                if not seg['is_target']: 
+                    continue
 
-            self.qc = qc
-            q_corr_edge = B.T @ qc
-            q_final_edge = q0_edge + q_corr_edge
+                y_eval = seg['yc']
 
-            for e in self.graph_edges:
-                idx = edge_index_map[e['id']]
-                e['q0_mean'] = float(q0_edge[idx])
-                e['qc_correction'] = float(q_corr_edge[idx])
-                e['q_final_mean'] = float(q_final_edge[idx])
-                if 'q0' in e and e['q0'] is not None:
-                    e['q_final'] = e['q0'] + q_corr_edge[idx]
-                    e['q_final_geom'] = e['q_final']
+                # Q 계산: y_eval 보다 위에 있는 '모든(Stiffener 포함)' 1D 부재의 1차 모멘트
+                Q_val = 0.0
+                for s in all_mesh_segments:
+                    if s['yc'] >= y_eval:
+                        Q_val += s['area'] * (s['yc'] - self.calc_na_bl)
+
+                # Ty (수직 투영 두께의 합) 계산: y_eval 높이를 교차하는 '타겟 레이어' 부재들의 투영 두께 합
+                Ty = 0.0
+                for s in all_mesh_segments:
+                    if s['is_target'] and s['miny'] <= y_eval <= s['maxy']:
+                        if s['dy'] > 1e-3: # 수평선 배제
+                            t_y = s['t'] * (s['L'] / s['dy'])
+                            Ty += t_y
+
+                # τ = (V * Q) / (Ixx * Σty)
+                if self.calc_ixx > 0 and Ty > 0:
+                    tau = (V_shear * abs(Q_val)) / (self.calc_ixx * Ty)
                 else:
-                    e['q_final'] = np.array([q_final_edge[idx]])
-                    e['q_final_geom'] = e['q_final']
+                    tau = 0.0
 
-            qc_residual = M @ qc - r
-            qc_residual_norm = float(np.linalg.norm(qc_residual))
-            cell_balance = B @ (w * q_final_edge)
-            max_cell_balance = float(np.max(np.abs(cell_balance))) if len(cell_balance) else 0.0
-            max_qc_val = float(np.max(np.abs(qc))) if len(qc) else 0.0
-            max_qcorr_val = float(np.max(np.abs(q_corr_edge))) if len(q_corr_edge) else 0.0
-            max_qfinal_val = float(np.max(np.abs(q_final_edge))) if len(q_final_edge) else 0.0
+                seg['tau'] = tau
+                seg['q'] = tau * seg['t']
+                self.mesh_cells.append(seg)
 
-            # -------------------------------------------------------------
-            # 전단응력 tau = q_final / t 계산 및 최대 지점 탐색
-            # q [N/mm] / t [mm] = N/mm^2 = MPa
-            # -------------------------------------------------------------
-            max_tau_abs = 0.0
-            max_tau_info = {'edge_id': None, 'tau_abs': 0.0, 'tau_signed': 0.0, 'thickness': 0.0, 'point': None,
-                            'x': 0.0, 'y': 0.0}
+                if tau > max_tau:
+                    max_tau = tau
+                    max_tau_info = seg
 
-            for e in self.graph_edges:
-                t_edge = float(e.get('thickness', 0.0))
-                if t_edge <= 1e-12:
-                    tau_arr = np.zeros_like(e.get('q_final', np.array([0.0])), dtype=float)
-                else:
-                    tau_arr = np.array(e.get('q_final', np.array([0.0])), dtype=float) / t_edge
-                e['tau_final'] = tau_arr
-                e['tau_final_mean'] = float(np.mean(tau_arr)) if len(tau_arr) else 0.0
-                if len(tau_arr) > 0:
-                    idx_tau = int(np.argmax(np.abs(tau_arr)))
-                    tau_signed = float(tau_arr[idx_tau])
-                    tau_abs = abs(tau_signed)
-                    if tau_abs > max_tau_abs:
-                        max_tau_abs = tau_abs
-                        pts = e.get('sample_pts', [])
-                        if pts and idx_tau < len(pts):
-                            pt = pts[idx_tau]
-                        else:
-                            mp = e['line'].interpolate(0.5, normalized=True)
-                            pt = (mp.x, mp.y)
-                        max_tau_info = {'edge_id': e['id'], 'tau_abs': tau_abs, 'tau_signed': tau_signed,
-                                        'thickness': t_edge, 'point': pt, 'x': pt[0], 'y': pt[1]}
-            self.max_tau_info = max_tau_info
+            self.act_fs = max_tau
+            if max_tau_info:
+                self.max_shell_thk = max_tau_info['t']
+                self.max_mesh_coords = ((max_tau_info['p1'][0] + max_tau_info['p2'][0]) / 2.0, max_tau_info['yc'])
+                self.max_shell_q_idx = 1
+            else:
+                self.max_shell_thk = 0.0
+                self.max_mesh_coords = (0, 0)
+                self.max_shell_q_idx = -1
 
-            # -------------------------------------------------------------
-            # 간결 검증 리포트
-            # -------------------------------------------------------------
-            val_warnings = []
-            if missing_s_edges:
-                val_warnings.append(f"[WARN] S calculation missing for edges: {missing_s_edges}")
-            if max_q0_val > 10000:
-                val_warnings.append(f"[WARN] Excessive q0 value detected: {max_q0_val:.2f} N/mm")
-            if np.linalg.matrix_rank(M) < n_cells:
-                val_warnings.append("[WARN] BWB^T matrix is rank deficient")
-
-            visited_count = len(visited_nodes)
-            total_nodes = len(self.graph_nodes)
-            root_final_S = s_at_node.get(self.root_node, 0.0)
-
-  
-            # 출력창(결과) 리포트 업데이트
-            # =============================================================
+            # 출력창 리포트 업데이트
             res = f"--- Applied Loads ---\n"
             res += f"S.W.B.M          : {self.raw_swbm:,.2f} tm\n"
             res += f"Shear Force      : {self.raw_shear:,.2f} t\n\n"
@@ -1909,29 +1114,15 @@ class UltimateShipAnalyzer(QMainWindow):
             res += f"Zact_btm         : {self.calc_z_btm:,.4f} m^3\n"
             res += f"Zact_top         : {self.calc_z_top:,.4f} m^3\n\n"
 
-            res += f"--- 1D Extraction & Graph Results ---\n"
-            res += f"Centerlines      : {len(self.centerlines)} (Incl. Stiffeners)\n"
-            res += f"Shear Edges      : {len(self.shear_flow_centerlines)} (No Stiffeners)\n"
-            res += f"Detected Cells   : {len(self.mesh_cells)} (Closed Loops)\n"
-            res += f"Strict Vertices  : {len(self.graph_nodes)} (Only true corners/junctions)\n"
-            res += f"Macro Graph Edges: {len(self.graph_edges)} (Merged Paths)\n"
-            res += f"Tree Edges       : {len([e for e in self.graph_edges if not e['is_slit']])}\n"
-            res += f"Slit Edges       : {len(self.slit_edge_ids)} (BFS Outward 적용)\n\n"
-
-            res += f"--- Validation Info ---\n"
-            res += f"Root Node ID     : {self.root_node} (Slit 인접, Centerline 근처)\n"
-            res += f"Root Initial S   : {root_residual:.4e} (Must be 0.0)\n"
-            res += f"Visited Nodes    : {visited_count} / {total_nodes}\n"
-            res += f"Missing S Edges  : {len(missing_s_edges)}\n"
-            res += f"Loop Residuals   : {len(loop_residuals)} edges (for qc correction)\n"
-            res += f"Max |q0|         : {max_q0_val:.2f} N/mm\n"
-            res += self.qc_validation_report
-
-            if val_warnings:
-                res += "\n--- WARNINGS ---\n"
-                for w in val_warnings:
-                    res += f"{w}\n"
-                    print(w)
+            res += f"--- Max Shear Information (Vertical Thickness Method) ---\n"
+            res += f"Location          : X: {self.max_mesh_coords[0]:.0f}, Y: {self.max_mesh_coords[1]:.0f}\n"
+            res += f"Plate Thickness   : {self.max_shell_thk} mm\n"
+            res += f"Max Shear Stress  : {self.act_fs:.2f} N/mm²\n"
+            res += f"Max Shear Flow(q) : {self.act_fs * self.max_shell_thk:.2f} N/mm\n"
+            
+            # [삭제된 함수 명시]
+            res += "\n--- System Note ---\n"
+            res += "* Removed unused functions:\n  ShearFlowSingleDialog, _extract_lines, _clone_cl_with_line, cell_edge_sign, edge_unit_vector\n"
 
             self.base_report = res
             self.result_box.setText(self.base_report)
@@ -1942,36 +1133,6 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setMaximum(0)
             QApplication.processEvents()
             self.refresh_ui()
-
-            self.refresh_ui()
-
-            # 기존 팝업 제거
-            for dlg in getattr(self, "debug_dialogs", []):
-                try:
-                    dlg.close()
-                except:
-                    pass
-
-            self.debug_dialogs = []
-
-            # 새 팝업 생성
-            if self.graph_edges:
-                self.dialog_q0 = ShearFlowSingleDialog(
-                    self.graph_edges, self.graph_nodes, self.root_node, mode="q0", parent=self
-                )
-                self.dialog_qc = ShearFlowSingleDialog(
-                    self.graph_edges, self.graph_nodes, self.root_node, mode="qc", parent=self
-                )
-                self.dialog_qfinal = ShearFlowSingleDialog(
-                    self.graph_edges, self.graph_nodes, self.root_node, mode="q_final", parent=self
-                )
-
-                self.dialog_q0.show()
-                self.dialog_qc.show()
-                self.dialog_qfinal.show()
-
-                self.debug_dialogs = [self.dialog_q0, self.dialog_qc, self.dialog_qfinal]
-
 
         except UserWarning as uw:
             self.result_box.setText(f"⚠️ {str(uw)}")
@@ -2000,7 +1161,7 @@ class UltimateShipAnalyzer(QMainWindow):
         final_res = self.base_report + "\n--- Strength Check & Utilization ---\n"
         final_res += f"Material         : {self.combo_material_type.currentText()}\n\n"
         final_res += f"Bending Stress   : {self.act_fb:.2f} / {self.allow_fb:.2f} N/mm2 ({self.act_fb / self.allow_fb * 100:.1f}%) [{'PASS' if self.act_fb <= self.allow_fb else 'FAIL'}]\n"
-        final_res += f"Shear Stress     : (Pending - 순환 전단류 q_c 산출 대기중)\n"
+        final_res += f"Shear Stress     : {self.act_fs:.2f} / {self.allow_fs:.2f} N/mm2 ({self.act_fs / self.allow_fs * 100:.1f}%) [{'PASS' if self.act_fs <= self.allow_fs else 'FAIL'}]\n"
         self.result_box.setText(final_res)
         self.btn_save_frame.setEnabled(True)
 
@@ -2020,7 +1181,7 @@ class UltimateShipAnalyzer(QMainWindow):
             "Act_FB": round(self.act_fb, 1), "Allow_FB": round(self.allow_fb, 1),
             "Shear": self.raw_shear,
             "Pos_Shear": f"S{self.max_shell_q_idx + 1}" if self.max_shell_q_idx != -1 else "N/A",
-            "Thk": self.max_shell_thk, "Unit_q": self.q_per_v * 1e3,
+            "Thk": self.max_shell_thk, "Unit_q": self.act_fs * self.max_shell_thk,
             "Act_FS": round(self.act_fs, 1), "Allow_FS": round(self.allow_fs, 1),
             "ImgSec": img_sec.getvalue(), "ImgShr": img_shr.getvalue()
         }
@@ -2142,29 +1303,29 @@ class UltimateShipAnalyzer(QMainWindow):
                 for c in range(1, 13): ws.cell(r, c).border = b_all
 
             ws.cell(5, 1, "*Allowable stress").font = f_11b
-            ws.merge_cells('A6:A8');
+            ws.merge_cells('A6:A8')
             ws.cell(6, 1, "Bending Stress")
-            ws.merge_cells('B6:C6');
+            ws.merge_cells('B6:C6')
             ws.cell(6, 2, "Continuous Section")
-            ws.merge_cells('D6:L6');
+            ws.merge_cells('D6:L6')
             ws.cell(6, 4, "143/k for bending stress")
-            ws.merge_cells('B7:C8');
+            ws.merge_cells('B7:C8')
             ws.cell(7, 2, "Discontinuous Section")
-            ws.merge_cells('D7:F7');
+            ws.merge_cells('D7:F7')
             ws.cell(7, 4, "60 N/mm² for S/H (Mild)")
-            ws.merge_cells('G7:I7');
+            ws.merge_cells('G7:I7')
             ws.cell(7, 7, "75 N/mm² for S/H (H.T)")
-            ws.merge_cells('J7:L7');
+            ws.merge_cells('J7:L7')
             ws.cell(7, 10, "112 N/mm² for S/H (H.T with BKT)")
-            ws.merge_cells('D8:F8');
+            ws.merge_cells('D8:F8')
             ws.cell(8, 4, "112 N/mm² for D/H (Mild)")
-            ws.merge_cells('G8:I8');
+            ws.merge_cells('G8:I8')
             ws.cell(8, 7, "150 N/mm² for D/H (H.T)")
-            ws.merge_cells('J8:L8');
+            ws.merge_cells('J8:L8')
             ws.cell(8, 10, "157 N/mm² for D/H (H.T with BKT)")
-            ws.merge_cells('A9:C9');
+            ws.merge_cells('A9:C9')
             ws.cell(9, 1, "Shear Stress")
-            ws.merge_cells('D9:L9');
+            ws.merge_cells('D9:L9')
             ws.cell(9, 4, "105/k for shear stress")
             for r in range(6, 10):
                 for c in range(1, 13):
@@ -2179,8 +1340,8 @@ class UltimateShipAnalyzer(QMainWindow):
                            "Percentage\n(%)", "Result"]
                 for i, h in enumerate(headers, 1):
                     cell = ws.cell(row_idx, i, h)
-                    cell.alignment = a_c;
-                    cell.font = f_10n;
+                    cell.alignment = a_c
+                    cell.font = f_10n
                     cell.border = b_all
 
                 r2 = [data['Frame'], data['SWBM'], data['Depth'], data['NA'], data['Ixx'],
@@ -2189,8 +1350,8 @@ class UltimateShipAnalyzer(QMainWindow):
                       "OK" if data['Act_FB'] <= data['Allow_FB'] else "NG"]
                 for i, v in enumerate(r2, 1):
                     cell = ws.cell(row_idx + 1, i, v)
-                    cell.alignment = a_c;
-                    cell.border = b_all;
+                    cell.alignment = a_c
+                    cell.border = b_all
                     cell.font = f_11n
                     if i in [2, 3, 4, 5, 6]: cell.fill = fill_y
                     if i in [9, 10, 11]: cell.fill = fill_g
@@ -2305,23 +1466,18 @@ class UltimateShipAnalyzer(QMainWindow):
         self.shell_thickness_inputs.clear()
 
         if self.is_calculated:
+            # 1. 1D Centerline + Thickness (Polygon 형태 원본 출력)
             if self.centerlines:
                 for cl in self.centerlines:
                     lo = cl['line']
                     x, y = lo.xy
                     ct = cl.get('type', '')
-                    if ct == '1999':
-                        color = '#FF00FF'
-                    elif ct == '157':
-                        color = '#00FFFF'
-                    elif ct == '1102':
-                        color = '#FFA500'
-                    elif ct == 'stiffener':
-                        color = '#008000'
-                    elif ct == 'bridge':
-                        color = '#00CC00'
-                    else:
-                        color = '#00FF00'
+                    if ct == '1999': color = '#FF00FF'
+                    elif ct == '157': color = '#00FFFF'
+                    elif ct == '1102': color = '#FFA500'
+                    elif ct == 'bridge': color = '#00CC00'
+                    else: color = '#00FF00'
+                    
                     thk = cl.get('thickness', 10.0)
 
                     if thk > 0:
@@ -2336,17 +1492,29 @@ class UltimateShipAnalyzer(QMainWindow):
                             pass
                     ax1.plot(x, y, color=color, linewidth=2.5, alpha=0.9, zorder=10, linestyle='-')
 
+            # 2. Shear Stress Heatmap (100mm 분할 세그먼트 출력)
             if hasattr(self, 'mesh_cells') and self.mesh_cells:
-                cmap = matplotlib.colormaps.get_cmap('tab20')
-                for idx, poly in enumerate(self.mesh_cells):
-                    color = cmap(idx % 20)
-                    ax2.fill(*poly.exterior.xy, color=color, alpha=0.4)
-                    ax2.plot(*poly.exterior.xy, color=color, linewidth=1.5)
+                taus = [seg['tau'] for seg in self.mesh_cells]
+                vmax = max(taus) if taus and max(taus) > 0 else 1.0
+                norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
+                cmap = cm.jet
 
-            if hasattr(self, 'cell_points') and self.cell_points:
-                ax2.plot([p[0] for p in self.cell_points], [p[1] for p in self.cell_points], 'ro', markersize=4,
-                         markeredgecolor='white', markeredgewidth=0.5,
-                         label=f'Points ({len(self.cell_points)})', zorder=11)
+                for seg in self.mesh_cells:
+                    if seg['tau'] > vmax * 0.001:
+                        color = cmap(norm(seg['tau']))
+                        xs = [seg['p1'][0], seg['p2'][0]]
+                        ys = [seg['p1'][1], seg['p2'][1]]
+                        ax2.plot(xs, ys, color=color, linewidth=3.0)
+
+                # Max Shear Probe
+                if hasattr(self, 'max_mesh_coords') and self.act_fs > 0:
+                    mx, my = self.max_mesh_coords
+                    ax2.plot(mx, my, 'r*', markersize=15, markeredgecolor='white', label="Max Stress Point", zorder=10)
+                    ax2.text(mx, my + 50, f"Max τ: {self.act_fs:.2f} MPa\nthk: {self.max_shell_thk} mm", 
+                             color='red', fontsize=10, fontweight='bold', ha='center', va='bottom',
+                             bbox=dict(facecolor='white', alpha=0.7, edgecolor='red'))
+                             
+                self.fig2.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax2, label="Shear Stress (MPa)")
 
             h, l = ax2.get_legend_handles_labels()
             if h: ax2.legend(loc="upper right", fontsize=8)
@@ -2380,11 +1548,8 @@ class UltimateShipAnalyzer(QMainWindow):
         self.can1.draw()
         self.can2.draw()
 
-
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = UltimateShipAnalyzer()
     win.show()
     sys.exit(app.exec())
-            
